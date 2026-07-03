@@ -1,0 +1,44 @@
+{
+  "891407628364840971": {
+    "robloxUsername": "KINGFANTASTlC",
+    "verifiedAt": 1782006080840,
+    "adConfig": {
+      "offer": [
+        {
+          "id": "110673146052704",
+          "instanceId": 238875120218,
+          "name": "Clockwork's Golden Shades #1",
+          "acronym": "GCWS",
+          "copiesOwned": 3
+        },
+        {
+          "id": "128217885",
+          "instanceId": 239189772756,
+          "name": "Fall Fairy",
+          "acronym": "FaFa",
+          "copiesOwned": 1
+        },
+        {
+          "id": "16477149823",
+          "instanceId": 232488687623,
+          "name": "Gold Clockwork Headphones #2",
+          "acronym": "GCWHP",
+          "copiesOwned": 3
+        },
+        {
+          "id": "16477149823",
+          "instanceId": 232488687623,
+          "name": "Gold Clockwork Headphones #2",
+          "acronym": "GCWHP",
+          "copiesOwned": 3
+        }
+      ],
+      "request": [],
+      "tags": [
+        "upgrade"
+      ],
+      "robux": 0,
+      "cooldownMinutes": 20
+    }
+  }
+}
