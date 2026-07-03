@@ -7,6 +7,7 @@ const path = require('path');
 const fs = require('fs');
 
 const SESSIONS_DIR = path.join(__dirname, '..', 'sessions');
+const SESSIONS_DIR = path.join(__dirname, '..', 'storage', 'sessions');
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 
 function sessionFile(discordId) {
@@ -26,6 +27,29 @@ async function startVerification(robloxUsername) {
   const browser = await chromium.launch({ headless: !SHOW_BROWSER });
   const context = await browser.newContext();
   const page = await context.newPage();
+
+  // TEMP DEBUG — capture every XHR/fetch response so we can see whether
+  // the live-search API call behind the result card succeeds, fails, or
+  // gets blocked/rate-limited when run from Railway's IP.
+  const xhrLog = [];
+  page.on('response', (res) => {
+  page.on('response', async (res) => {
+    try {
+      const req = res.request();
+      if (['xhr', 'fetch'].includes(req.resourceType())) {
+        xhrLog.push(`${res.status()} ${req.method()} ${res.url()}`);
+        let entry = `${res.status()} ${req.method()} ${res.url()}`;
+        // The playersearch call is the one that actually decides whether
+        // the result card renders — capture its body so we can see
+        // definitively whether Rolimons found a match or returned empty.
+        if (res.url().includes('playersearch')) {
+          const body = await res.text().catch(() => '(failed to read body)');
+          entry += `\n    BODY: ${body.slice(0, 500)}`;
+        }
+        xhrLog.push(entry);
+      }
+    } catch {}
+  });
 
   await page.goto('https://www.rolimons.com/verify', { waitUntil: 'domcontentloaded' });
 
@@ -53,7 +77,21 @@ async function startVerification(robloxUsername) {
   // (div[data-ref="player"] with an onclick handler) — we need to
   // actually click it, pressing Enter alone does not select a result.
   const resultCard = page.locator('div[data-ref="player"]').first();
-  await resultCard.waitFor({ state: 'visible', timeout: 15000 });
+  try {
+    await resultCard.waitFor({ state: 'visible', timeout: 15000 });
+  } catch (err) {
+    // TEMP DEBUG — remove once we've diagnosed why the result card
+    // isn't showing up on Railway. Dumps page state straight into the
+    // Railway Deploy Logs so we don't need to transfer a screenshot.
+    const typedValue = await verifyInput.inputValue().catch(() => '(could not read)');
+    console.error('DEBUG startVerification — value left in search box:', typedValue);
+    console.error('DEBUG startVerification — XHR/fetch calls seen:', JSON.stringify(xhrLog, null, 2));
+    const bodyHtml = await page.evaluate(() => document.body.innerHTML).catch(() => '(failed to read body)');
+    console.error('DEBUG startVerification — body content (first 3000 chars):', bodyHtml.slice(0, 3000));
+
+    await browser.close().catch(() => {}); // avoid leaking a zombie browser on failure
+    throw err;
+  }
   await resultCard.click();
 
   // Give the page a moment to load the verification phrase section
