@@ -4,8 +4,11 @@ const store = require('./store');
 const rolimons = require('./rolimons');
 const rolimonsApi = require('./rolimons-api');
 const { TRADE_TAGS } = require('./constants');
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection (bot stayed alive):', err);
+});
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
 
 // Keep open browser sessions in memory between /startlogin and /confirm,
 // keyed by Discord user ID. These are temporary, not the saved long-term
@@ -36,8 +39,75 @@ async function postSuccess(guild, robloxUsername) {
   await channel.send(`✅ Posted trade ad for **${robloxUsername}**`);
 }
 
+// Starts a posting loop for a given Discord user ID + their stored user
+// record. Shared by /start (self) and /forcestart (admin, on someone
+// else's behalf). Returns { ok: true } or { ok: false, reason }.
+function startPostingLoop(targetDiscordId, targetUser, guild) {
+  if (activeLoops.has(targetDiscordId)) {
+    return { ok: false, reason: 'already_running' };
+  }
+  if (!rolimons.hasSession(targetDiscordId)) {
+    return { ok: false, reason: 'not_logged_in' };
+  }
+
+  const adConfig = targetUser.adConfig;
+  if (!adConfig || !adConfig.offer || adConfig.offer.length === 0) {
+    return { ok: false, reason: 'no_offer' };
+  }
+  const reqCount = (adConfig.request || []).length + (adConfig.tags || []).length;
+  if (reqCount > 4) {
+    return { ok: false, reason: 'too_many_slots' };
+  }
+
+  const cooldownMs = (adConfig.cooldownMinutes || 15) * 60 * 1000;
+
+  const runPost = async () => {
+    const playerId = await rolimonsApi.getPlayerIdByUsername(targetUser.robloxUsername);
+    const result = await rolimonsApi.postTradeAd(targetDiscordId, {
+      offerItemIds: adConfig.offer.map(i => i.id),
+      requestItemIds: (adConfig.request || []).map(i => i.id),
+      requestTags: adConfig.tags || [],
+      robux: adConfig.robux || 0,
+    }, playerId);
+
+    if (result.ok) {
+      await postSuccess(guild, targetUser.robloxUsername);
+    } else {
+      const messages = {
+        daily_limit: '24 hour ad creation limit has been hit',
+        cooldown: 'your cooldown time has not been reached',
+        missing_items: 'player does not have all offered items',
+        logged_out: 'user logged out, please log back in',
+        not_logged_in: 'user logged out, please log back in',
+        unknown: 'your trade ad had an unknown error',
+      };
+      await postError(guild, targetDiscordId, messages[result.reason] || messages.unknown);
+
+      if (result.reason === 'logged_out' || result.reason === 'not_logged_in') {
+        clearInterval(activeLoops.get(targetDiscordId));
+        activeLoops.delete(targetDiscordId);
+      }
+    }
+  };
+
+  runPost(); // post once immediately
+  const intervalHandle = setInterval(runPost, cooldownMs);
+  activeLoops.set(targetDiscordId, intervalHandle);
+  return { ok: true, cooldownMinutes: adConfig.cooldownMinutes || 15 };
+}
+
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
+});
+
+// Auto-stop a user's posting loop if they leave the server.
+client.on('guildMemberRemove', (member) => {
+  const handle = activeLoops.get(member.id);
+  if (handle) {
+    clearInterval(handle);
+    activeLoops.delete(member.id);
+    console.log(`Stopped posting loop for ${member.id} (left the server).`);
+  }
 });
 
 // ---------- Autocomplete (live suggestions while typing in a slot) ----------
@@ -208,6 +278,7 @@ client.on('interactionCreate', async (interaction) => {
     const fs = require('fs');
     const path = require('path');
     const sessionPath = path.join(__dirname, '..', 'sessions', `${discordId}.json`);
+    const sessionPath = path.join(__dirname, '..', 'storage', 'sessions', `${discordId}.json`);
     if (fs.existsSync(sessionPath)) fs.unlinkSync(sessionPath);
     store.deleteUser(discordId);
 
@@ -447,68 +518,20 @@ client.on('interactionCreate', async (interaction) => {
       });
     }
 
-    const adConfig = user.adConfig;
-    if (!adConfig || !adConfig.offer || adConfig.offer.length === 0) {
-      return interaction.reply({
-        content: '❌ You need at least 1 offer item set up. Use **/create** first.',
-        ephemeral: true,
-      });
-    }
-    const reqCount = (adConfig.request || []).length + (adConfig.tags || []).length;
-    if (reqCount > 4) {
-      return interaction.reply({
-        content: '❌ Your request items + tags exceed 4 combined. Fix this with **/create** before starting.',
-        ephemeral: true,
-      });
-    }
-
-    if (activeLoops.has(discordId)) {
-      return interaction.reply({
-        content: '⚠️ You already have posting running. Use **/stop** first if you want to change anything.',
-        ephemeral: true,
-      });
-    }
-
-    const cooldownMs = (adConfig.cooldownMinutes || 15) * 60 * 1000;
-
-    const runPost = async () => {
-      const playerId = await rolimonsApi.getPlayerIdByUsername(user.robloxUsername);
-      const result = await rolimonsApi.postTradeAd(discordId, {
-        offerItemIds: adConfig.offer.map(i => i.id),
-        requestItemIds: (adConfig.request || []).map(i => i.id),
-        requestTags: adConfig.tags || [],
-        robux: adConfig.robux || 0,
-      }, playerId);
-
-      const guild = interaction.guild;
-      if (result.ok) {
-        await postSuccess(guild, user.robloxUsername);
-      } else {
-        const messages = {
-          daily_limit: '24 hour ad creation limit has been hit',
-          cooldown: 'your cooldown time has not been reached',
-          missing_items: 'player does not have all offered items',
-          logged_out: 'user logged out, please log back in',
-          not_logged_in: 'user logged out, please log back in',
-          unknown: 'your trade ad had an unknown error',
-        };
-        await postError(guild, discordId, messages[result.reason] || messages.unknown);
-
-        // If logged out, stop the loop — retrying won't help until they log in again.
-        if (result.reason === 'logged_out' || result.reason === 'not_logged_in') {
-          clearInterval(activeLoops.get(discordId));
-          activeLoops.delete(discordId);
-        }
-      }
+    const result = startPostingLoop(discordId, user, interaction.guild);
+    const errorMessages = {
+      already_running: '⚠️ You already have posting running. Use **/stop** first if you want to change anything.',
+      not_logged_in: '❌ You need to log in first. Run **/startlogin** to begin.',
+      no_offer: '❌ You need at least 1 offer item set up. Use **/create** first.',
+      too_many_slots: '❌ Your request items + tags exceed 4 combined. Fix this with **/create** before starting.',
     };
 
-    // Post once immediately, then on the cooldown interval.
-    await runPost();
-    const intervalHandle = setInterval(runPost, cooldownMs);
-    activeLoops.set(discordId, intervalHandle);
+    if (!result.ok) {
+      return interaction.reply({ content: errorMessages[result.reason], ephemeral: true });
+    }
 
     return interaction.reply({
-      content: `✅ Started! Your ad will post every ${adConfig.cooldownMinutes || 15} minutes. Use **/stop** to cancel.`,
+      content: `✅ Started! Your ad will post every ${result.cooldownMinutes} minutes. Use **/stop** to cancel.`,
       ephemeral: true,
     });
   }
@@ -527,6 +550,57 @@ client.on('interactionCreate', async (interaction) => {
     activeLoops.delete(discordId);
 
     return interaction.reply({ content: '✅ Stopped automatic posting.', ephemeral: true });
+  }
+
+  // ---------- /forcestop (admin) ----------
+  if (interaction.commandName === 'forcestop') {
+    const targetUser = interaction.options.getUser('user');
+    const handle = activeLoops.get(targetUser.id);
+
+    if (!handle) {
+      return interaction.reply({
+        content: `${targetUser.username} doesn't have automatic posting running right now.`,
+        ephemeral: true,
+      });
+    }
+
+    clearInterval(handle);
+    activeLoops.delete(targetUser.id);
+
+    return interaction.reply({
+      content: `✅ Stopped automatic posting for ${targetUser.username}.`,
+      ephemeral: true,
+    });
+  }
+
+  // ---------- /forcestart (admin) ----------
+  if (interaction.commandName === 'forcestart') {
+    const targetUser = interaction.options.getUser('user');
+    const targetUserData = store.getUser(targetUser.id);
+
+    if (!targetUserData) {
+      return interaction.reply({
+        content: `❌ ${targetUser.username} hasn't logged in yet (no /startlogin completed).`,
+        ephemeral: true,
+      });
+    }
+
+    const result = startPostingLoop(targetUser.id, targetUserData, interaction.guild);
+    const errorMessages = {
+      already_running: `⚠️ ${targetUser.username} already has posting running.`,
+      not_logged_in: `❌ ${targetUser.username} needs to log in again (session expired or missing).`,
+      no_offer: `❌ ${targetUser.username} doesn't have an offer item set up.`,
+      too_many_slots: `❌ ${targetUser.username}'s request items + tags exceed 4 combined.`,
+    };
+
+    if (!result.ok) {
+      return interaction.reply({ content: errorMessages[result.reason], ephemeral: true });
+    }
+
+    return interaction.reply({
+      content: `✅ Started posting for ${targetUser.username}, every ${result.cooldownMinutes} minutes.`,
+      ephemeral: true,
+    });
   }
 });
 
