@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 
 const SESSIONS_DIR = path.join(__dirname, '..', 'sessions');
+const SESSIONS_DIR = path.join(__dirname, '..', 'storage', 'sessions');
 
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
